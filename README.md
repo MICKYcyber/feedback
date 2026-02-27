@@ -1,15 +1,22 @@
 # Roblox Sound Testing
 
-This repo now includes a Luau processor that mimics the "decoded mp3" style effect described in your chat:
+This repo includes a Luau **MP3-like lo-fi emulation** module.
 
-- preset frequency-band shaping (`bands` table)
-- decode-rate emulation (`emulatedDecodeHz` downsample + hold)
-- optional bit crush (`bitDepth`)
-- fixed-step processing loop on `RunService.PreSimulation` to reduce frame jitter impact
+> Correction: Roblox does **not** currently provide general real-time PCM read/write for `Sound` in normal experiences, so this module does not depend on a non-existent `EditableAudio` API.
 
 ## File
 
 - `src/Mp3LikeEmulation.lua`
+
+## What it does
+
+- Emulates decoded-MP3-ish degradation for numeric sample arrays:
+  - decode-rate downsample + hold (`emulatedDecodeHz`)
+  - rough band shaping (`bands`)
+  - bit-crush quantization (`bitDepth`)
+  - dry/wet mix (`mix`)
+- Provides a fixed-step scheduler on `RunService.PreSimulation` (`lockedProcessHz`) to avoid tying updates directly to fluctuating visual FPS.
+- Exposes `getSuggestedSoundEffectParams()` for mapping the lo-fi character onto Roblox `EqualizerSoundEffect`/`DistortionSoundEffect` settings when using ordinary `Sound` playback.
 
 ## Quick usage
 
@@ -24,14 +31,15 @@ local processor = Mp3LikeEmulation.new({
 	mix = 1,
 })
 
-processor:start()
+-- 1) If you have your own sample arrays:
+local processed = processor:processChunk({0.0, 0.2, -0.1, 0.6})
 
--- In your own audio pipeline:
--- local processed = processor:processChunk(monoSamples)
--- write processed samples back into your EditableAudio buffer
+-- 2) If you're using regular Sound instances, map the character to effects:
+local params = processor:getSuggestedSoundEffectParams()
+-- Apply params.eqHighGain / eqMidGain / eqLowGain / distortionLevel to your effect instances.
+
+-- 3) Optional fixed-rate loop for stable updates:
+processor:start(function(dt)
+	-- update effect parameters, automation, or other timing-sensitive logic
+end)
 ```
-
-## Notes
-
-- `PreSimulation` is still tied to engine updates, but the internal accumulator makes processing run at a **locked step** (`lockedProcessHz`) so it does not directly depend on fluctuating render FPS.
-- `_tick` is intentionally left as integration glue for your specific EditableAudio read/write flow.

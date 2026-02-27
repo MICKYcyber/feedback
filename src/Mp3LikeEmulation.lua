@@ -3,14 +3,13 @@
 --
 -- Mp3LikeEmulation
 --
--- A lightweight "decoded mp3" style effect for EditableAudio sample buffers.
--- It intentionally degrades fidelity by:
--- 1) quantizing frequency bands to preset gains
--- 2) reducing sample rate to a target Hz bucket
--- 3) optionally lowering bit depth
+-- Roblox does not expose real-time PCM sample read/write APIs in standard experiences.
+-- This module therefore focuses on:
+--   1) processing plain Luau sample arrays (for custom audio pipelines/tools), and
+--   2) providing a fixed-step scheduler on PreSimulation so updates run at a stable rate.
 --
--- Designed to run on RunService.PreSimulation with an internal fixed-rate accumulator
--- so processing speed is stable even when visual FPS fluctuates.
+-- If you are using normal Sound instances, use this as a *parameter generator* for
+-- sound effects rather than direct PCM mutation.
 --
 
 local RunService = game:GetService("RunService")
@@ -23,8 +22,6 @@ export type Band = {
 
 export type Config = {
 	sampleRate: number,
-	channelCount: number,
-	frameSize: number,
 	lockedProcessHz: number,
 	emulatedDecodeHz: number,
 	bitDepth: number,
@@ -33,26 +30,32 @@ export type Config = {
 	mix: number,
 }
 
+export type LoFiParams = {
+	eqHighGain: number,
+	eqMidGain: number,
+	eqLowGain: number,
+	distortionLevel: number,
+}
+
 export type Processor = {
-	start: (self: Processor) -> (),
+	start: (self: Processor, onStep: ((dt: number) -> ())?) -> (),
 	stop: (self: Processor) -> (),
-	processChunk: (self: Processor, monoSamples: { number }) -> { number },
 	isRunning: (self: Processor) -> boolean,
+	processChunk: (self: Processor, monoSamples: { number }) -> { number },
+	getSuggestedSoundEffectParams: (self: Processor) -> LoFiParams,
 }
 
 local DEFAULT_BANDS: { Band } = {
 	{ minHz = 20, maxHz = 120, gain = 1.05 },
-	{ minHz = 120, maxHz = 450, gain = 0.95 },
-	{ minHz = 450, maxHz = 1800, gain = 1.1 },
-	{ minHz = 1800, maxHz = 5000, gain = 0.85 },
-	{ minHz = 5000, maxHz = 12000, gain = 0.75 },
-	{ minHz = 12000, maxHz = 20000, gain = 0.62 },
+	{ minHz = 120, maxHz = 450, gain = 0.92 },
+	{ minHz = 450, maxHz = 1800, gain = 1.08 },
+	{ minHz = 1800, maxHz = 5000, gain = 0.8 },
+	{ minHz = 5000, maxHz = 12000, gain = 0.68 },
+	{ minHz = 12000, maxHz = 20000, gain = 0.55 },
 }
 
 local DEFAULT_CONFIG: Config = {
 	sampleRate = 48000,
-	channelCount = 1,
-	frameSize = 512,
 	lockedProcessHz = 120,
 	emulatedDecodeHz = 24000,
 	bitDepth = 10,
@@ -84,10 +87,10 @@ local function deepCopy<T>(t: T): T
 	return clone :: any
 end
 
-local function mergeConfig(override: {[string]: any}?): Config
+local function mergeConfig(override: { [string]: any }?): Config
 	local config: Config = deepCopy(DEFAULT_CONFIG)
 	if override then
-		for key, value in override :: any do
+		for key, value in override do
 			(config :: any)[key] = value
 		end
 	end
@@ -100,9 +103,9 @@ local function quantizeSample(sample: number, bitDepth: number): number
 	return (stepped / (levels - 1) - 0.5) * 2
 end
 
-local function estimateBandGain(index: number, sampleRate: number, bands: { Band }): number
+local function estimateBandGain(sampleIndex: number, chunkSize: number, sampleRate: number, bands: { Band }): number
 	local nyquist = sampleRate * 0.5
-	local hz = (index / 512) * nyquist
+	local hz = (sampleIndex / math.max(1, chunkSize)) * nyquist
 	for _, band in bands do
 		if hz >= band.minHz and hz < band.maxHz then
 			return band.gain
@@ -111,13 +114,13 @@ local function estimateBandGain(index: number, sampleRate: number, bands: { Band
 	return 1
 end
 
-function Mp3LikeEmulation.new(configOverride: {[string]: any}?): Processor
+function Mp3LikeEmulation.new(configOverride: { [string]: any }?): Processor
 	local self = setmetatable({}, Mp3LikeEmulation)
 	self._config = mergeConfig(configOverride)
 	self._running = false
 	self._accumulator = 0
 	self._conn = nil
-	self._queue = {}
+	self._onStep = nil
 	return self
 end
 
@@ -147,9 +150,8 @@ function Mp3LikeEmulation:_applyBandApprox(samples: { number }): { number }
 	local config: Config = self._config
 	local out = table.create(#samples)
 	for i = 1, #samples do
-		local gain = estimateBandGain(i, config.sampleRate, config.bands)
-		local driven = clamp(samples[i] * gain * config.drive, -1, 1)
-		out[i] = driven
+		local gain = estimateBandGain(i, #samples, config.sampleRate, config.bands)
+		out[i] = clamp(samples[i] * gain * config.drive, -1, 1)
 	end
 	return out
 end
@@ -180,27 +182,37 @@ function Mp3LikeEmulation:processChunk(monoSamples: { number }): { number }
 	return out
 end
 
-function Mp3LikeEmulation:_tick(_stepSeconds: number)
-	-- Intentionally left minimal: this is where game-specific code should
-	-- read from EditableAudio buffers, call processChunk, then write back.
-	-- The fixed-step loop in start() is the anti-FPS-jitter piece.
+function Mp3LikeEmulation:getSuggestedSoundEffectParams(): LoFiParams
+	local c: Config = self._config
+	local topBand = c.bands[#c.bands]
+	local midBand = c.bands[math.max(1, math.floor(#c.bands / 2))]
+	local lowBand = c.bands[1]
+
+	return {
+		eqHighGain = clamp((topBand and topBand.gain or 1) * -15, -80, 10),
+		eqMidGain = clamp(((midBand and midBand.gain or 1) - 1) * 10, -80, 10),
+		eqLowGain = clamp(((lowBand and lowBand.gain or 1) - 1) * 10, -80, 10),
+		distortionLevel = clamp((16 - c.bitDepth) / 16 + (c.drive - 1) * 0.25, 0, 1),
+	}
 end
 
-function Mp3LikeEmulation:start()
+function Mp3LikeEmulation:start(onStep: ((dt: number) -> ())?)
 	if self._running then
 		return
 	end
 
-	local config: Config = self._config
-	local fixedStep = 1 / math.max(1, config.lockedProcessHz)
+	local fixedStep = 1 / math.max(1, self._config.lockedProcessHz)
 	self._running = true
 	self._accumulator = 0
+	self._onStep = onStep
 
 	self._conn = RunService.PreSimulation:Connect(function(deltaTime: number)
 		self._accumulator += deltaTime
 		while self._accumulator >= fixedStep do
 			self._accumulator -= fixedStep
-			self:_tick(fixedStep)
+			if self._onStep then
+				self._onStep(fixedStep)
+			end
 		end
 	end)
 end
@@ -210,6 +222,7 @@ function Mp3LikeEmulation:stop()
 		return
 	end
 	self._running = false
+	self._onStep = nil
 	if self._conn then
 		self._conn:Disconnect()
 		self._conn = nil
